@@ -6,6 +6,7 @@ module Frobbo.DOMVarReactive
   ( div_
   , span_
   , spanS_
+  , button
   , react
   , zoom
   , getTopDomElement
@@ -32,12 +33,14 @@ import Frobbo.DOMVar
 data DOMBuild state
   = PlaceDiv [DOMBuild state]
   | PlaceSpan Text
+  | PlaceButton Text (IO ())
   | forall key. (Eq key, Typeable key) => Zoom (state -> key) (key -> DOMBuild key)
   | forall key. (Eq key, Typeable key) => React (state -> key) (key -> DOMBuild state)
 
 instance Contravariant DOMBuild where
   contramap co (PlaceDiv inners) = PlaceDiv $ fmap (contramap co) inners
   contramap _ (PlaceSpan txt) = PlaceSpan txt
+  contramap _ (PlaceButton txt button) = PlaceButton txt button
   contramap co (Zoom state inner) =
     Zoom
     (\new_state -> state (co new_state))
@@ -55,6 +58,9 @@ zoom zoomer = Zoom zoomer
 
 div_ :: [DOMBuild a] -> DOMBuild a
 div_ = PlaceDiv
+
+button :: Text -> IO () -> DOMBuild state
+button = PlaceButton
 
 span_ :: Text -> DOMBuild state
 span_ = PlaceSpan
@@ -117,6 +123,11 @@ toDOMVar' state (PlaceDiv inner) = do
   inner_tags <- traverse (toDOMVar' state) inner
   div <- newDOMVar Div inner_tags
   return div
+toDOMVar' _ (PlaceButton txt event) = do
+  var <- newDOMVar Button []
+  setDOMVarText var txt
+  addClickEventHandler var event
+  return var
 toDOMVar' state (Zoom keyer inner) = do
   let keyed = keyer state
   (inner_stuff, Triggers inner_triggers) <- lift $

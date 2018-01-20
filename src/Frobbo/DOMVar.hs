@@ -19,6 +19,8 @@ module Frobbo.DOMVar
   , setDOMVarText
   , setClassName
   , getClassName
+  -- * Events
+  , addClickEventHandler
   -- * Document body
   , getBody )
   where
@@ -28,6 +30,7 @@ import Control.Monad
 import Control.Monad.IO.Class
 import Control.Concurrent
 import GHC.Generics
+import GHCJS.Foreign.Callback
 import GHCJS.Types
 import Data.Data
 import Data.Foldable
@@ -45,10 +48,17 @@ foreign import javascript "$r = document.body;" jsGetBody :: IO JSVal
 foreign import javascript "$r = $1.className;" jsGetClassName :: JSVal -> IO JSString
 foreign import javascript "$1.className = $2;" jsSetClassName :: JSVal -> JSString -> IO ()
 foreign import javascript "while ($1.firstChild) { $1.removeChild($1.firstChild); };" jsRemoveAllChildren :: JSVal -> IO ()
+foreign import javascript "$1.addEventListener('click', $2);" jsAddClickEventHandler :: JSVal -> Callback (IO ()) -> IO ()
 
-newtype DOMElement = DOMElement JSVal
+newtype DOMElement = DOMElement { toJSVal :: JSVal }
 
-data DOMVar = DOMVar (MVar (DOMElement, DOMElement -> Maybe DOMElement -> IO (), DOMTag))
+data DOMContents = DOMContents
+  { domElement       :: DOMElement
+  , updateReferences :: DOMElement -> Maybe DOMElement -> IO ()
+  , domTag           :: DOMTag
+  , clickEvents      :: [Callback (IO ())] }
+
+data DOMVar = DOMVar (MVar DOMContents)
   deriving ( Eq, Typeable, Generic )
 
 -- | These are all the tags supported by `DOMVar`.
@@ -59,20 +69,26 @@ data DOMTag
   | P
   | Body
   | Hr
+  | Button
   deriving ( Eq, Ord, Show, Read, Typeable, Data, Generic, Enum )
 
 tagToName :: DOMTag -> JSString
-tagToName Div  = pack "div"
-tagToName Span = pack "span"
-tagToName P    = pack "p"
-tagToName Body = pack "body"
-tagToName Br   = pack "br"
-tagToName Hr   = pack "hr"
+tagToName Div    = pack "div"
+tagToName Span   = pack "span"
+tagToName P      = pack "p"
+tagToName Body   = pack "body"
+tagToName Br     = pack "br"
+tagToName Hr     = pack "hr"
+tagToName Button = pack "button"
 
 getBody :: MonadIO m => m DOMVar
 getBody = liftIO $ do
   body_ref <- jsGetBody
-  DOMVar <$> newMVar (DOMElement body_ref, \_ _ -> return (), Body)
+  DOMVar <$> newMVar (DOMContents
+    { domElement       = DOMElement body_ref
+    , updateReferences = \_ _ -> return ()
+    , domTag           = Body
+    , clickEvents      = [] })
 
 -- | Creates a new `DOMVar`, with its tag and children.
 newDOMVar :: MonadIO m => DOMTag -> [DOMVar] -> m DOMVar
@@ -81,7 +97,11 @@ newDOMVar tag children = liftIO $ mask_ $ do
 
   fitTag new_tag_ref children
 
-  DOMVar <$> newMVar (DOMElement new_tag_ref, \_ _ -> return (), tag)
+  DOMVar <$> newMVar (DOMContents
+    { domElement       = DOMElement new_tag_ref
+    , updateReferences = \_ _ -> return ()
+    , domTag           = tag
+    , clickEvents      = [] })
 
 setFinalizerDOMVar :: MonadIO m => DOMVar -> IO () -> m ()
 setFinalizerDOMVar (DOMVar mvar) finalizer = liftIO $
@@ -90,12 +110,10 @@ setFinalizerDOMVar (DOMVar mvar) finalizer = liftIO $
 fitTag :: JSVal -> [DOMVar] -> IO ()
 fitTag new_tag_ref children =
   for_ children $ \(DOMVar child_mvar) -> do
-    modifyMVar_ child_mvar $ \(DOMElement child_dom_element, update_ref, child_tag) -> do
-      update_ref (DOMElement child_dom_element) Nothing
-      jsAppendChild new_tag_ref child_dom_element
-      return (DOMElement child_dom_element,
-              childUpdater new_tag_ref,
-              child_tag)
+    modifyMVar_ child_mvar $ \domcontents -> do
+      updateReferences domcontents (domElement domcontents) Nothing
+      jsAppendChild new_tag_ref (toJSVal $ domElement domcontents)
+      return $ domcontents { updateReferences = childUpdater new_tag_ref }
  where
   childUpdater :: JSVal -> DOMElement -> Maybe DOMElement -> IO ()
   childUpdater new_tag_ref
@@ -111,47 +129,63 @@ fitTag new_tag_ref children =
 -- | Modifies the tag and children of a `DOMVar`. Does not modify the text.
 modifyDOMVar :: MonadIO m => DOMVar -> DOMTag -> [DOMVar] -> m ()
 modifyDOMVar (DOMVar mvar) tag new_children = liftIO $ mask_ $
-  modifyMVar_ mvar $ \(DOMElement old_ref, update_ref, old_tag) -> do
-    old_text <- jsGetText old_ref
+  modifyMVar_ mvar $ \domcontents -> do  -- (DOMElement old_ref, update_ref, old_tag) -> do
+    old_text <- jsGetText $ toJSVal $ domElement domcontents
 
     -- Remove all children upfront
     for_ new_children $ \(DOMVar child_mvar) ->
-      modifyMVar_ child_mvar $ \(child_dom_element, update_ref, child_tag) -> do
-        update_ref child_dom_element Nothing
-        return (child_dom_element, \_ _ -> return (), child_tag)
+      modifyMVar_ child_mvar $ \child_domcontents -> do
+        updateReferences child_domcontents (domElement child_domcontents) Nothing
+        return child_domcontents { updateReferences = \_ _ -> return () }
 
     -- If DOM tag hasn't changed, re-use previous DOM element, and don't call
     -- updater for the reference.
-    tag_ref <- if old_tag /= tag
-                 then do old_class_name <- jsGetClassName old_ref
+    tag_ref <- if domTag domcontents /= tag
+                 then do old_class_name <- jsGetClassName (toJSVal $ domElement domcontents)
                          new_ref <- jsCreateElement (tagToName tag)
                          jsSetClassName new_ref old_class_name
                          jsSetText new_ref old_text
-                         update_ref (DOMElement old_ref) (Just $ DOMElement new_ref)
+                         for_ (clickEvents domcontents) $ \click_event ->
+                           jsAddClickEventHandler new_ref click_event
+                         updateReferences domcontents (domElement domcontents) (Just $ DOMElement new_ref)
                          return new_ref
 
-                 else do jsRemoveAllChildren old_ref
-                         return old_ref
+                 else do jsRemoveAllChildren $ toJSVal $ domElement domcontents
+                         return $ toJSVal $ domElement domcontents
 
     fitTag tag_ref new_children
 
-    return (DOMElement tag_ref, update_ref, tag)
+    return domcontents
+      { domElement =  DOMElement tag_ref
+      , domTag     =  tag }
 
 -- | Sets the text on a `DOMVar`.
 setDOMVarText :: MonadIO m => DOMVar -> Text -> m ()
 setDOMVarText (DOMVar mvar) new_text = liftIO $
-  withMVar mvar $ \(DOMElement tag_ref, _, _) ->
-    jsSetText tag_ref (pack $ T.unpack new_text)
+  withMVar mvar $ \domcontents ->
+    jsSetText (toJSVal $ domElement domcontents) (pack $ T.unpack new_text)
 
 -- | Sets new CSS class name for a `DOMVar`.
 setClassName :: MonadIO m => DOMVar -> Text -> m ()
 setClassName (DOMVar mvar) class_name = liftIO $
-  withMVar mvar $ \(DOMElement tag_ref, _, _) ->
-    jsSetClassName tag_ref (pack $ T.unpack class_name)
+  withMVar mvar $ \domcontents ->
+    jsSetClassName (toJSVal $ domElement domcontents) (pack $ T.unpack class_name)
 
 -- | Gets the current CSS class name in a `DOMVar`.
 getClassName :: MonadIO m => DOMVar -> m Text
 getClassName (DOMVar mvar) = liftIO $
-  withMVar mvar $ \(DOMElement tag_ref, _, _) ->
-    T.pack . unpack <$> jsGetClassName tag_ref
+  withMVar mvar $ \domcontents ->
+    T.pack . unpack <$> jsGetClassName (toJSVal $ domElement domcontents)
+
+-- | Adds an event handler for clicks.
+addClickEventHandler :: MonadIO m => DOMVar -> IO () -> m ()
+addClickEventHandler (DOMVar mvar) event = liftIO $ mask_ $ do
+  cb <- modifyMVar mvar $ \domcontents -> do
+    cb <- syncCallback ContinueAsync event
+    jsAddClickEventHandler
+      (toJSVal $ domElement domcontents)
+      cb
+    return (domcontents
+      { clickEvents = cb:clickEvents domcontents }, cb)
+  void $ mkWeakMVar mvar $ releaseCallback cb
 
