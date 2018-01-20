@@ -1,0 +1,8 @@
+.stack-work/
+*.swp
+*~
+index.html
+*.hi
+*.o
+bundle.js
+
